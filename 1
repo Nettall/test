@@ -1,0 +1,97 @@
+variables:
+  MIGRATE_CMD: ""
+  SEED_CMD: ""
+  MIGRATE_SERVICE: app
+  APP_DIR: /opt/$APP_NAME
+
+stages:
+  - build
+  - deploy-test
+  - deploy-preprod
+  - deploy-prod
+
+.build:
+  stage: build
+  image: docker:27-cli
+  tags: [build]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "vide-develop"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  before_script:
+    - apk add --no-cache gettext openssh-client
+  script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_JOB_TOKEN $CI_REGISTRY
+    - docker build -t "$CI_REGISTRY_IMAGE/$COMPONENT:$CI_COMMIT_SHORT_SHA" "$CONTEXT"
+    - docker push "$CI_REGISTRY_IMAGE/$COMPONENT:$CI_COMMIT_SHORT_SHA"
+
+# Общий деплой: куда — DEPLOY_HOST, секреты — ENV_SECRETS / DEPLOY_SSH_KEY
+# со scope на окружение (test / preprod / prod)
+.deploy:
+  tags: [build]
+  before_script:
+    - apk add --no-cache gettext openssh-client curl
+    - chmod 600 "$DEPLOY_SSH_KEY"
+    - mkdir -p ~/.ssh && echo "StrictHostKeyChecking no" > ~/.ssh/config
+  script:
+    - ssh -i "$DEPLOY_SSH_KEY" deploy@"$DEPLOY_HOST" "mkdir -p $APP_DIR"
+    - envsubst < deploy/env.tpl > .env
+    - if [ -n "$ENV_SECRETS" ]; then echo >> .env; cat "$ENV_SECRETS" >> .env; fi
+    - scp -i "$DEPLOY_SSH_KEY" .env deploy@"$DEPLOY_HOST":"$APP_DIR/"
+    - scp -i "$DEPLOY_SSH_KEY" docker-compose.yml deploy@"$DEPLOY_HOST":"$APP_DIR/"
+
+    - |
+      ssh -i "$DEPLOY_SSH_KEY" deploy@"$DEPLOY_HOST" \
+        "echo $CI_REGISTRY_PASSWORD | docker login -u $CI_REGISTRY_USER --password-stdin $CI_REGISTRY"
+
+    - |
+      ssh -i "$DEPLOY_SSH_KEY" deploy@"$DEPLOY_HOST" \
+        "cd $APP_DIR && docker compose pull"
+
+    - |
+      if [ -n "$MIGRATE_CMD" ]; then
+        ssh -i "$DEPLOY_SSH_KEY" deploy@"$DEPLOY_HOST" \
+          "cd $APP_DIR && docker compose run --rm $MIGRATE_SERVICE $MIGRATE_CMD"
+      fi
+
+    - |
+      ssh -i "$DEPLOY_SSH_KEY" deploy@"$DEPLOY_HOST" \
+        "cd $APP_DIR && docker compose up -d"
+
+    - sh ./ci/smoke.sh "http://$DEPLOY_HOST:$APP_PORT"
+
+deploy_test:
+  extends: .deploy
+  stage: deploy-test
+  environment: test
+  resource_group: test
+  variables:
+    DEPLOY_HOST: $TEST_HOST
+    APP_ENV: test
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "vide-develop"
+
+# Появляется, только если в проекте задан PREPROD_HOST
+deploy_preprod:
+  extends: .deploy
+  stage: deploy-preprod
+  environment: preprod
+  resource_group: preprod
+  variables:
+    DEPLOY_HOST: $PREPROD_HOST
+    APP_ENV: preprod
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $PREPROD_HOST
+
+# Тот же образ, что прошёл препрод; запуск — кнопкой
+deploy_prod:
+  extends: .deploy
+  stage: deploy-prod
+  environment: prod
+  resource_group: prod
+  variables:
+    DEPLOY_HOST: $PROD_HOST
+    APP_ENV: prod
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $PROD_HOST
+      when: manual
