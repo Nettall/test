@@ -1,0 +1,8 @@
+services:
+  front:
+    image: nexus.chkpz.ru:8443/docker-hub/nginx:1.30.4-alpine
+    restart: always
+    ports: ["4509:80"]
+    volumes:
+      - ./dist:/usr/share/nginx/html:ro
+      - ./default.conf:/etc/nginx/conf.d/default.conf:ro
